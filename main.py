@@ -31,6 +31,13 @@ class Socks5Error(RuntimeError):
     pass
 
 
+def _fmt_exc(e: BaseException) -> str:
+    s = str(e).strip()
+    if s:
+        return f"{type(e).__name__}: {s}"
+    return type(e).__name__
+
+
 def _socks5_rep_to_msg(rep: int) -> str:
     table = {
         0x01: "general SOCKS server failure",
@@ -61,10 +68,12 @@ async def socks5_open_tunnel(
             timeout=timeout,
         )
     except Exception as e:
-        raise Socks5Error(f"upstream socks5 connect failed: {e}") from e
+        raise Socks5Error(f"upstream socks5 connect failed: {_fmt_exc(e)}") from e
 
     # greeting
-    methods = [0x02] if username is not None else [0x00]
+    # If credentials are provided, offer both username/password and no-auth to
+    # accommodate servers that ignore auth while still working.
+    methods = [0x02, 0x00] if username is not None else [0x00]
     writer.write(bytes([0x05, len(methods), *methods]))
     await writer.drain()
 
@@ -72,13 +81,17 @@ async def socks5_open_tunnel(
         ver, method = (await asyncio.wait_for(reader.readexactly(2), timeout=timeout))
     except Exception as e:
         writer.close()
-        raise Socks5Error(f"socks5 greeting read failed: {e}") from e
+        raise Socks5Error(f"socks5 greeting read failed: {_fmt_exc(e)}") from e
 
     if ver != 0x05:
         writer.close()
         raise Socks5Error(f"invalid socks version: {ver}")
 
     # username/password auth
+    if method == 0xFF:
+        writer.close()
+        raise Socks5Error("socks5: server rejected offered auth methods")
+
     if method == 0x02:
         if username is None or password is None:
             writer.close()
@@ -97,7 +110,7 @@ async def socks5_open_tunnel(
             aver, status = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
         except Exception as e:
             writer.close()
-            raise Socks5Error(f"socks5 auth read failed: {e}") from e
+            raise Socks5Error(f"socks5 auth read failed: {_fmt_exc(e)}") from e
 
         if aver != 0x01 or status != 0x00:
             writer.close()
@@ -142,7 +155,7 @@ async def socks5_open_tunnel(
         hdr = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
     except Exception as e:
         writer.close()
-        raise Socks5Error(f"socks5 reply read failed: {e}") from e
+        raise Socks5Error(f"socks5 reply read failed: {_fmt_exc(e)}") from e
 
     rver, rep, _rsv, ratyp = hdr
     if rver != 0x05:
@@ -167,7 +180,7 @@ async def socks5_open_tunnel(
         await reader.readexactly(2)
     except Exception as e:
         writer.close()
-        raise Socks5Error(f"socks5 reply parse failed: {e}") from e
+        raise Socks5Error(f"socks5 reply parse failed: {_fmt_exc(e)}") from e
 
     return reader, writer
 
@@ -205,6 +218,20 @@ async def _bidir(a_r, a_w, b_r, b_w):
 
 
 def _parse_connect_target(target: str):
+    target = target.strip()
+
+    # RFC 7231: authority-form for CONNECT. Commonly "host:port".
+    # IPv6 literal may arrive as "[::1]:443".
+    if target.startswith("["):
+        end = target.find("]")
+        if end == -1:
+            raise ValueError("invalid CONNECT target (unterminated IPv6 literal)")
+        host = target[1:end]
+        rest = target[end + 1 :]
+        if rest.startswith(":") and len(rest) > 1:
+            return host, int(rest[1:])
+        return host, 443
+
     if ":" not in target:
         return target, 443
     host, port_s = target.rsplit(":", 1)
@@ -232,6 +259,8 @@ async def handle_client(
     socks_port: int,
     username: str | None,
     password: str | None,
+    socks_timeout: float = 15.0,
+    verbose: bool = False,
 ):
     try:
         raw = await client_r.readuntil(b"\r\n\r\n")
@@ -239,20 +268,27 @@ async def handle_client(
         client_w.close()
         return
 
+    dst_label = None
     try:
         head = raw.decode("iso-8859-1")
         lines = head.split("\r\n")
         method, target, version = lines[0].split(" ", 2)
         method_u = method.upper()
-    except Exception:
+        if verbose:
+            peer = client_w.get_extra_info("peername")
+            print(f"[>] {peer} {method_u} {target} {version}")
+    except Exception as e:
+        if verbose:
+            print(f"[!] Bad request line: {e!r}")
         client_w.close()
         return
 
     try:
         if method_u == "CONNECT":
             dst_host, dst_port = _parse_connect_target(target)
+            dst_label = f"{dst_host}:{dst_port}"
             up_r, up_w = await socks5_open_tunnel(
-                dst_host, dst_port, socks_host, socks_port, username, password
+                dst_host, dst_port, socks_host, socks_port, username, password, timeout=socks_timeout
             )
             client_w.write(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: nord-shim\r\n\r\n")
             await client_w.drain()
@@ -261,8 +297,9 @@ async def handle_client(
 
         # HTTP proxy absolute-form
         dst_host, dst_port, path = _extract_host_port_from_absolute_url(target)
+        dst_label = f"{dst_host}:{dst_port}"
         up_r, up_w = await socks5_open_tunnel(
-            dst_host, dst_port, socks_host, socks_port, username, password
+            dst_host, dst_port, socks_host, socks_port, username, password, timeout=socks_timeout
         )
 
         new_lines = [f"{method} {path} {version}"]
@@ -284,14 +321,26 @@ async def handle_client(
         await _bidir(client_r, client_w, up_r, up_w)
 
     except Socks5Error as e:
+        if verbose:
+            print(f"[!] Upstream SOCKS5 error for {dst_label or 'unknown target'}: {e}")
         try:
-            msg = f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nUpstream SOCKS5 error: {e}\n"
+            msg = (
+                "HTTP/1.1 502 Bad Gateway\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n"
+                "\r\n"
+                f"Upstream SOCKS5 error for {dst_label or 'unknown target'}: {e}\n"
+            )
             client_w.write(msg.encode("utf-8", "replace"))
             await client_w.drain()
         except Exception:
             pass
         client_w.close()
     except Exception:
+        if verbose:
+            import traceback
+
+            print(f"[!] Unexpected proxy error for {dst_label or 'unknown target'}:")
+            traceback.print_exc()
         try:
             client_w.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             await client_w.drain()
@@ -301,9 +350,18 @@ async def handle_client(
 
 
 async def run_proxy(listen_host: str, listen_port: int, socks_host: str, socks_port: int,
-                    username: str | None, password: str | None):
+                    username: str | None, password: str | None, socks_timeout: float = 15.0, verbose: bool = False):
     server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, socks_host, socks_port, username, password),
+        lambda r, w: handle_client(
+            r,
+            w,
+            socks_host,
+            socks_port,
+            username,
+            password,
+            socks_timeout=socks_timeout,
+            verbose=verbose,
+        ),
         host=listen_host,
         port=listen_port,
         limit=65536,
@@ -391,15 +449,63 @@ def launch_firefox(firefox_exe: str, profile_dir: str, start_url: str | None, ex
     return subprocess.Popen(cmd)
 
 
+def _apply_socks_url_overrides(args: argparse.Namespace) -> None:
+    """
+    Allow passing SOCKS endpoint as a single URL or host:port for convenience.
+
+    Examples:
+      - socks5://user:pass@host:1080
+      - host:1080
+    """
+    socks = getattr(args, "socks", None)
+    if not socks:
+        return
+
+    s = str(socks).strip()
+    if not s:
+        return
+
+    if "://" not in s:
+        # host[:port]
+        if s.count(":") == 1:
+            host, port_s = s.rsplit(":", 1)
+            args.socks_host = host
+            args.socks_port = int(port_s)
+        else:
+            args.socks_host = s
+        return
+
+    u = urlsplit(s)
+    if u.scheme and u.scheme.lower() not in ("socks5", "socks"):
+        raise SystemExit(f"Unsupported SOCKS URL scheme: {u.scheme!r} (use socks5://...)")
+    if not u.hostname:
+        raise SystemExit("Invalid --socks URL (no hostname)")
+
+    args.socks_host = u.hostname
+    if u.port is not None:
+        args.socks_port = u.port
+    if u.username is not None or u.password is not None:
+        args.socks_user = u.username
+        args.socks_pass = u.password
+
+
 def main():
     ap = argparse.ArgumentParser(description="Run Firefox through NordVPN SOCKS5 via local HTTP CONNECT shim proxy.")
-    ap.add_argument("--socks-host", required=True, help="NordVPN SOCKS5 host")
+    ap.add_argument("--socks", default=None, help="SOCKS endpoint as URL (e.g. socks5://user:pass@host:1080) or host:port")
+    ap.add_argument("--socks-host", default=None, help="NordVPN SOCKS5 host")
     ap.add_argument("--socks-port", type=int, default=1080, help="NordVPN SOCKS5 port (default: 1080)")
     ap.add_argument("--socks-user", default=os.environ.get("NORD_SOCKS_USER"), help="SOCKS5 username (or env NORD_SOCKS_USER)")
     ap.add_argument("--socks-pass", default=os.environ.get("NORD_SOCKS_PASS"), help="SOCKS5 password (or env NORD_SOCKS_PASS)")
 
     ap.add_argument("--listen-host", default="127.0.0.1", help="Local proxy listen host (default: 127.0.0.1)")
     ap.add_argument("--listen-port", type=int, default=18080, help="Local proxy listen port (default: 18080)")
+
+    ap.add_argument("--socks-timeout", type=float, default=15.0, help="SOCKS connect/handshake timeout seconds (default: 15)")
+    ap.add_argument("--proxy-only", action="store_true", help="Run proxy only (do not launch Firefox / profile)")
+    ap.add_argument("--check-upstream", action="store_true", help="Check SOCKS5 connectivity then exit")
+    ap.add_argument("--check-host", default="example.com", help="Host for --check-upstream (default: example.com)")
+    ap.add_argument("--check-port", type=int, default=443, help="Port for --check-upstream (default: 443)")
+    ap.add_argument("--verbose", action="store_true", help="Verbose logging")
 
     ap.add_argument("--firefox-path", default=None, help="Path to firefox executable")
     ap.add_argument("--profile-dir", default=None, help="Firefox profile dir (default: temp dir)")
@@ -408,24 +514,61 @@ def main():
 
     args = ap.parse_args()
 
+    _apply_socks_url_overrides(args)
+
+    if not args.socks_host:
+        print("[-] Provide --socks-host or --socks.")
+        sys.exit(2)
+
     if (args.socks_user is None) != (args.socks_pass is None):
         print("[-] Provide both --socks-user and --socks-pass (or env vars), or neither.")
         sys.exit(2)
 
-    firefox_exe = find_firefox_exe(args.firefox_path)
+    if args.check_upstream:
+        async def _check():
+            r, w = await socks5_open_tunnel(
+                args.check_host,
+                args.check_port,
+                args.socks_host,
+                args.socks_port,
+                args.socks_user,
+                args.socks_pass,
+                timeout=args.socks_timeout,
+            )
+            w.close()
+            try:
+                await w.wait_closed()
+            except Exception:
+                pass
+
+        try:
+            asyncio.run(_check())
+            print(f"[+] Upstream SOCKS5 OK: {args.socks_host}:{args.socks_port} -> {args.check_host}:{args.check_port}")
+            return
+        except Socks5Error as e:
+            print(f"[-] Upstream SOCKS5 FAILED: {e}")
+            sys.exit(1)
+
+    firefox_exe = None
+    if not args.proxy_only:
+        firefox_exe = find_firefox_exe(args.firefox_path)
 
     temp_profile = None
-    if args.profile_dir:
-        profile_dir = args.profile_dir
-        Path(profile_dir).mkdir(parents=True, exist_ok=True)
-    else:
-        temp_profile = tempfile.mkdtemp(prefix="firefox-nord-profile-")
-        profile_dir = temp_profile
+    profile_dir = None
+    if not args.proxy_only:
+        if args.profile_dir:
+            profile_dir = args.profile_dir
+            Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        else:
+            temp_profile = tempfile.mkdtemp(prefix="firefox-nord-profile-")
+            profile_dir = temp_profile
 
-    # Firefox는 로컬 HTTP 프록시만 보게 고정
-    write_profile_prefs(profile_dir, args.listen_host, args.listen_port)
+        # Firefox는 로컬 HTTP 프록시만 보게 고정
+        write_profile_prefs(profile_dir, args.listen_host, args.listen_port)
 
-    ff_proc = launch_firefox(firefox_exe, profile_dir, args.url, args.ff_arg)
+    ff_proc = None
+    if not args.proxy_only:
+        ff_proc = launch_firefox(firefox_exe, profile_dir, args.url, args.ff_arg)
 
     try:
         asyncio.run(
@@ -436,6 +579,8 @@ def main():
                 args.socks_port,
                 args.socks_user,
                 args.socks_pass,
+                socks_timeout=args.socks_timeout,
+                verbose=args.verbose,
             )
         )
     except KeyboardInterrupt:
